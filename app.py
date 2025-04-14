@@ -64,23 +64,21 @@ with tabs[1]:
 
     col1, col2, col3 = st.columns(3)
 
-    if user_text:
-        with col1:
-            if st.button("в нижний регистр"):
-                result = user_text.lower()
-                st.text_area("Результат:", result, height=150, key="lower")
-                copy_to_clipboard(result, "copy-btn-lower")
+    
+    with col1:
+        if st.button("в нижний регистр"):
+            result = user_text.lower()
+            st.text_area("Результат:", result, height=150, key="lower")
+            copy_to_clipboard(result, "copy-btn-lower")
 
-        with col2:
-            if st.button("В ВЕРХНИЙ РЕГИСТР"):
-                result = user_text.upper()
-                st.text_area("Результат:", result, height=150, key="upper")
-                copy_to_clipboard(result, "copy-btn-upper")
+    with col2:
+        if st.button("В ВЕРХНИЙ РЕГИСТР"):
+            result = user_text.upper()
+            st.text_area("Результат:", result, height=150, key="upper")
+            copy_to_clipboard(result, "copy-btn-upper")
 
-        with col3:
-            if st.button("Как в предложении"):
-                result = '. '.join([s.strip().capitalize() for s in user_text.split('.')])
-                st.text_area("Результат:", result, height=150, key="sentence")
-                copy_to_clipboard(result, "copy-btn-sentence")
-    else:
-        st.info("Введите текст")
+    with col3:
+        if st.button("Как в предложении"):
+            result = '. '.join([s.strip().capitalize() for s in user_text.split('.')])
+            st.text_area("Результат:", result, height=150, key="sentence")
+            copy_to_clipboard(result, "copy-btn-sentence")
