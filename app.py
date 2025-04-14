@@ -83,4 +83,4 @@ with tabs[1]:
                 st.text_area("Результат:", result, height=150, key="sentence")
                 copy_to_clipboard(result, "copy-btn-sentence")
     else:
-        st.info("Введите текст для преобразования.")
+        st.spinner
