@@ -26,7 +26,7 @@ def copy_to_clipboard(text, button_key):
     """, height=45)
 
 # --- Вкладки --- #
-tabs = st.tabs(["🔡 Генератор символов", "🧰 Регистры текста"])
+tabs = st.tabs(["🔡 Генератор символов", "🧰 Регистры текста", "🔢 Подсчёт символов"])
 
 # --- Вкладка 1: Генератор символов --- #
 with tabs[0]:
@@ -64,7 +64,6 @@ with tabs[1]:
 
     col1, col2, col3 = st.columns(3)
 
-    
     with col1:
         if st.button("в нижний регистр"):
             result = user_text.lower()
@@ -82,3 +81,14 @@ with tabs[1]:
             result = '. '.join([s.strip().capitalize() for s in user_text.split('.')])
             st.text_area("Результат:", result, height=150, key="sentence")
             copy_to_clipboard(result, "copy-btn-sentence")
+
+# --- Вкладка 3: Подсчёт символов --- #
+with tabs[2]:
+    st.header("🔢 Подсчёт количества символов")
+
+    count_text = st.text_area("Введите текст для подсчёта:", height=200)
+
+    if count_text:
+        st.write(f"**Всего символов:** {len(count_text)}")
+        st.write(f"**Без пробелов:** {len(count_text.replace(' ', ''))}")
+        st.write(f"**Количество слов:** {len(count_text.split())}")
