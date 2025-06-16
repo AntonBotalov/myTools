@@ -7,6 +7,7 @@ import streamlit.components.v1 as components
 import jwt
 import json
 from jwt.exceptions import InvalidTokenError
+import uuid  # Добавлен импорт модуля uuid
 
 st.set_page_config(page_title="Утилиты для текста", layout="wide")
 
@@ -48,29 +49,38 @@ tabs = st.tabs(["🎲 Генератор символов", "🔠 Регистр
 
 with tabs[0]:
     st.header("🎲 Генератор текста по символам")
-    alphabet_type = st.radio("Выберите тип символов:", ["Кириллица", "Латиница", "Гибрид"])
-    use_special = st.checkbox("Добавить спецсимволы и цифры")
-    num_chars = st.number_input("Количество символов:", min_value=1, value=12, step=1)
+    generator_type = st.radio("Выберите тип генератора:", ["Случайные символы", "GUID"])
+    
+    if generator_type == "Случайные символы":
+        alphabet_type = st.radio("Выберите тип символов:", ["Кириллица", "Латиница", "Гибрид"])
+        use_special = st.checkbox("Добавить спецсимволы и цифры")
+        num_chars = st.number_input("Количество символов:", min_value=1, value=12, step=1)
 
-    if 'generated_text' not in st.session_state:
-        st.session_state.generated_text = ''
+        if 'generated_text' not in st.session_state:
+            st.session_state.generated_text = ''
 
-    if st.button("🎲 Сгенерировать"):
-        if alphabet_type == "Кириллица":
-            alphabet = cyrillic_letters
-        elif alphabet_type == "Латиница":
-            alphabet = latin_letters
-        else:
-            alphabet = cyrillic_letters + latin_letters
+        if st.button("🎲 Сгенерировать"):
+            if alphabet_type == "Кириллица":
+                alphabet = cyrillic_letters
+            elif alphabet_type == "Латиница":
+                alphabet = latin_letters
+            else:
+                alphabet = cyrillic_letters + latin_letters
 
-        if use_special:
-            alphabet += special_chars
+            if use_special:
+                alphabet += special_chars
 
-        st.session_state.generated_text = ''.join(random.choice(alphabet) for _ in range(num_chars))
+            st.session_state.generated_text = ''.join(random.choice(alphabet) for _ in range(num_chars))
 
-    if st.session_state.generated_text:
-        st.code(st.session_state.generated_text, language="")
-        copy_to_clipboard(st.session_state.generated_text, "copy-btn-gen")
+        if st.session_state.generated_text:
+            st.code(st.session_state.generated_text, language="")
+            copy_to_clipboard(st.session_state.generated_text, "copy-btn-gen")
+    
+    else:  # Генерация GUID
+        if st.button("🎲 Сгенерировать GUID"):
+            generated_guid = str(uuid.uuid4())
+            st.code(generated_guid, language="")
+            copy_to_clipboard(generated_guid, "copy-btn-guid")
 
 with tabs[1]:
     st.header("🔠 Преобразование регистра текста")
