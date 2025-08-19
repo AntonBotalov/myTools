@@ -7,7 +7,9 @@ import streamlit.components.v1 as components
 import jwt
 import json
 from jwt.exceptions import InvalidTokenError
-import uuid  # Добавлен импорт модуля uuid
+import uuid
+import base64  # Добавлен импорт для base64
+import io  # Для работы с файлами
 
 st.set_page_config(page_title="Утилиты для текста", layout="wide")
 
@@ -45,7 +47,8 @@ def copy_to_clipboard(text, key):
         <button id="{key}" onclick="copyText()" style="margin: 5px 0; padding: 6px 14px; border-radius: 6px; background-color: #21A038; color: white; border: none; cursor: pointer;">📋 Копировать</button>
     """, height=45)
 
-tabs = st.tabs(["🎲 Генератор символов", "🔠 Регистры текста", "🧮 Подсчёт символов", "⚔️ Сравнение строк", "🔐 JWT кодер / декодер"])
+# Добавлена новая вкладка для Base64
+tabs = st.tabs(["🎲 Генератор", "🔠 Регистры текста", "🧮 Подсчёт символов", "⚔️ Сравнение строк", "🔐 JWT кодер / декодер", "📁 Base64 конвертер"])
 
 with tabs[0]:
     st.header("🎲 Генератор текста по символам")
@@ -173,3 +176,74 @@ with tabs[4]:
             copy_to_clipboard(token, "copy-jwt")
         except Exception as e:
             st.error(f"Ошибка кодирования: {str(e)}")
+
+# Новая вкладка для Base64 конвертера
+with tabs[5]:
+    st.header("📁 Base64 конвертер")
+    
+    conversion_type = st.radio("Выберите тип конвертации:", 
+                              ["Текст в Base64", "Base64 в текст", "Файл в Base64", "Base64 в файл"])
+    
+    if conversion_type == "Текст в Base64":
+        text_to_encode = st.text_area("Введите текст для кодирования:", height=150)
+        if st.button("🔒 Кодировать в Base64"):
+            if text_to_encode:
+                encoded = base64.b64encode(text_to_encode.encode('utf-8')).decode('utf-8')
+                st.text_area("Результат Base64:", encoded, height=150)
+                copy_to_clipboard(encoded, "copy-base64-encode")
+            else:
+                st.warning("Введите текст для кодирования")
+    
+    elif conversion_type == "Base64 в текст":
+        base64_to_decode = st.text_area("Введите Base64 для декодирования:", height=150)
+        if st.button("🔓 Декодировать из Base64"):
+            if base64_to_decode:
+                try:
+                    decoded = base64.b64decode(base64_to_decode).decode('utf-8')
+                    st.text_area("Декодированный текст:", decoded, height=150)
+                    copy_to_clipboard(decoded, "copy-base64-decode")
+                except Exception as e:
+                    st.error(f"Ошибка декодирования: {str(e)}")
+            else:
+                st.warning("Введите Base64 строку для декодирования")
+    
+    elif conversion_type == "Файл в Base64":
+        uploaded_file = st.file_uploader("Загрузите файл для кодирования", type=None)
+        if uploaded_file is not None:
+            if st.button("📁 Кодировать файл в Base64"):
+                file_bytes = uploaded_file.read()
+                encoded_file = base64.b64encode(file_bytes).decode('utf-8')
+                st.text_area("Base64 представление файла:", encoded_file, height=200)
+                copy_to_clipboard(encoded_file, "copy-file-base64")
+                
+                # Предложение скачать результат
+                st.download_button(
+                    label="📥 Скачать Base64 как файл",
+                    data=encoded_file,
+                    file_name=f"{uploaded_file.name}.base64.txt",
+                    mime="text/plain"
+                )
+    
+    elif conversion_type == "Base64 в файл":
+        base64_file_input = st.text_area("Введите Base64 строку файла:", height=150)
+        original_filename = st.text_input("Имя файла для сохранения (с расширением):", "decoded_file.bin")
+        
+        if st.button("💾 Восстановить файл из Base64"):
+            if base64_file_input:
+                try:
+                    file_data = base64.b64decode(base64_file_input)
+                    
+                    st.download_button(
+                        label="📥 Скачать восстановленный файл",
+                        data=file_data,
+                        file_name=original_filename,
+                        mime="application/octet-stream"
+                    )
+                    
+                    st.success("Файл готов к скачиванию!")
+                    st.info(f"Размер файла: {len(file_data)} байт")
+                    
+                except Exception as e:
+                    st.error(f"Ошибка декодирования файла: {str(e)}")
+            else:
+                st.warning("Введите Base64 строку файла")
