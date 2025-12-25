@@ -8,16 +8,19 @@ import jwt
 import json
 from jwt.exceptions import InvalidTokenError
 import uuid
-import base64  # Добавлен импорт для base64
-import io  # Для работы с файлами
+import base64
+import io
+import pandas as pd  # Добавлена библиотека pandas
 
-st.set_page_config(page_title="Утилиты для текста", layout="wide")
+st.set_page_config(page_title="Утилиты для текста и данных", layout="wide")
 
 cyrillic_letters = 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя'
 latin_letters = string.ascii_lowercase
 special_chars = string.punctuation + string.digits
 
 AVAILABLE_ALGORITHMS = ["HS256"]
+
+# --- Вспомогательные функции ---
 
 def get_highlighted(text_base, text_compare):
     matcher = SequenceMatcher(None, text_base, text_compare)
@@ -47,9 +50,45 @@ def copy_to_clipboard(text, key):
         <button id="{key}" onclick="copyText()" style="margin: 5px 0; padding: 6px 14px; border-radius: 6px; background-color: #21A038; color: white; border: none; cursor: pointer;">📋 Копировать</button>
     """, height=45)
 
-# Добавлена новая вкладка для Base64
-tabs = st.tabs(["🎲 Генератор", "🔠 Регистры текста", "🧮 Подсчёт символов", "⚔️ Сравнение строк", "🔐 JWT кодер / декодер", "📁 Base64 конвертер"])
+def to_excel(dfs_dict):
+    """Конвертирует словарь DataFrames в Excel файл в памяти"""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        for sheet_name, df in dfs_dict.items():
+            if not df.empty:
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+    return output.getvalue()
 
+def highlight_excel_diff(row, common_cols, df_old_indexed, df_new_indexed):
+    """Генерирует лог изменений для строки Excel"""
+    idx = row.name
+    changes = []
+    try:
+        old_row = df_old_indexed.loc[idx]
+        new_row = df_new_indexed.loc[idx]
+    except KeyError:
+        return "Ошибка индекса"
+
+    for col in common_cols:
+        val_old = old_row[col]
+        val_new = new_row[col]
+        if str(val_old) != str(val_new):
+            changes.append(f"{col}: '{val_old}' -> '{val_new}'")
+    return "; ".join(changes)
+
+# --- Основной интерфейс ---
+
+tabs = st.tabs([
+    "🎲 Генератор", 
+    "🔠 Регистры текста", 
+    "🧮 Подсчёт символов", 
+    "⚔️ Сравнение строк", 
+    "🔐 JWT кодер", 
+    "📁 Base64 конвертер",
+    "📊 Сравнение Excel"  # Новая вкладка
+])
+
+# 1. Генератор
 with tabs[0]:
     st.header("🎲 Генератор текста по символам")
     generator_type = st.radio("Выберите тип генератора:", ["Случайные символы", "GUID"])
@@ -85,6 +124,7 @@ with tabs[0]:
             st.code(generated_guid, language="")
             copy_to_clipboard(generated_guid, "copy-btn-guid")
 
+# 2. Регистры
 with tabs[1]:
     st.header("🔠 Преобразование регистра текста")
     user_text = st.text_area("Введите текст:", height=200)
@@ -108,6 +148,7 @@ with tabs[1]:
             st.text_area("Результат:", result, height=150, key="sentence")
             copy_to_clipboard(result, "copy-btn-sentence")
 
+# 3. Подсчет
 with tabs[2]:
     st.header("🧮 Подсчёт количества символов")
     count_text = st.text_area("Введите текст для подсчёта:", height=200, key="count_text_input")
@@ -122,7 +163,8 @@ with tabs[2]:
                     st.write(f"**Без пробелов:** {len(count_text.replace(' ', ''))}")
                 with col4:
                     st.write(f"**Количество слов:** {len(count_text.split())}")
-           
+
+# 4. Сравнение строк
 with tabs[3]:
     st.header("⚔️ Сравнение двух текстов")
     col1, col2 = st.columns(2)
@@ -148,7 +190,8 @@ with tabs[3]:
                     {get_highlighted(text1, text2)}
                 </div>
             """, unsafe_allow_html=True)
-            
+
+# 5. JWT
 with tabs[4]:
     st.header("🔐 JWT кодер / декодер")
     st.subheader("Декодировать JWT")
@@ -177,7 +220,7 @@ with tabs[4]:
         except Exception as e:
             st.error(f"Ошибка кодирования: {str(e)}")
 
-# Новая вкладка для Base64 конвертера
+# 6. Base64
 with tabs[5]:
     st.header("📁 Base64 конвертер")
     
@@ -216,7 +259,6 @@ with tabs[5]:
                 st.text_area("Base64 представление файла:", encoded_file, height=200)
                 copy_to_clipboard(encoded_file, "copy-file-base64")
                 
-                # Предложение скачать результат
                 st.download_button(
                     label="📥 Скачать Base64 как файл",
                     data=encoded_file,
@@ -232,18 +274,132 @@ with tabs[5]:
             if base64_file_input:
                 try:
                     file_data = base64.b64decode(base64_file_input)
-                    
                     st.download_button(
                         label="📥 Скачать восстановленный файл",
                         data=file_data,
                         file_name=original_filename,
                         mime="application/octet-stream"
                     )
-                    
                     st.success("Файл готов к скачиванию!")
-                    st.info(f"Размер файла: {len(file_data)} байт")
-                    
                 except Exception as e:
                     st.error(f"Ошибка декодирования файла: {str(e)}")
             else:
                 st.warning("Введите Base64 строку файла")
+
+# 7. Сравнение Excel (НОВОЕ)
+with tabs[6]:
+    st.header("📊 Сравнение Excel таблиц")
+    st.markdown("Загрузите два файла, выберите ключ (ID/Артикул) и получите отчет о добавленных, удаленных и измененных строках.")
+
+    col_upl1, col_upl2 = st.columns(2)
+    with col_upl1:
+        file1 = st.file_uploader("Загрузите ПЕРВЫЙ файл (Старый)", type=["xlsx", "xls"], key="excel_old")
+    with col_upl2:
+        file2 = st.file_uploader("Загрузите ВТОРОЙ файл (Новый)", type=["xlsx", "xls"], key="excel_new")
+
+    if file1 and file2:
+        try:
+            # Чтение имен листов
+            xl1 = pd.ExcelFile(file1)
+            xl2 = pd.ExcelFile(file2)
+            
+            common_sheets = list(set(xl1.sheet_names) & set(xl2.sheet_names))
+            
+            if common_sheets:
+                selected_sheet = st.selectbox("Выберите лист для сравнения", common_sheets, key="excel_sheet_select")
+                df1 = pd.read_excel(file1, sheet_name=selected_sheet)
+                df2 = pd.read_excel(file2, sheet_name=selected_sheet)
+            else:
+                st.warning("Листы не совпадают, используется первый лист.")
+                df1 = pd.read_excel(file1, sheet_name=0)
+                df2 = pd.read_excel(file2, sheet_name=0)
+
+            df1 = df1.fillna("")
+            df2 = df2.fillna("")
+
+            # Выбор ключа
+            common_columns = list(set(df1.columns) & set(df2.columns))
+            key_col = st.selectbox(
+                "Выберите ключевую колонку для сверки (ID, Артикул)", 
+                options=["-- Без ключа (сравнение строк) --"] + common_columns,
+                key="excel_key_col"
+            )
+
+            if st.button("🚀 Сравнить файлы", key="excel_btn_compare", type="primary"):
+                result_dfs = {}
+                
+                if key_col != "-- Без ключа (сравнение строк) --":
+                    # Сравнение по ключу
+                    if not df1[key_col].is_unique or not df2[key_col].is_unique:
+                        st.error(f"Ошибка: значения в колонке '{key_col}' не уникальны!")
+                    else:
+                        df1_idx = df1.set_index(key_col)
+                        df2_idx = df2.set_index(key_col)
+
+                        # Удаленные
+                        removed_keys = df1_idx.index.difference(df2_idx.index)
+                        df_removed = df1_idx.loc[removed_keys].reset_index()
+                        
+                        # Добавленные
+                        added_keys = df2_idx.index.difference(df1_idx.index)
+                        df_added = df2_idx.loc[added_keys].reset_index()
+                        
+                        # Измененные
+                        common_keys = df1_idx.index.intersection(df2_idx.index)
+                        cols_to_compare = [c for c in common_columns if c != key_col]
+                        
+                        # Маска изменений
+                        mask_diff = (df1_idx.loc[common_keys, cols_to_compare] != df2_idx.loc[common_keys, cols_to_compare]).any(axis=1)
+                        changed_keys = common_keys[mask_diff]
+                        df_changed = df2_idx.loc[changed_keys].reset_index()
+
+                        # Детализация
+                        if not df_changed.empty:
+                            df_changed['LOG_ИЗМЕНЕНИЙ'] = df_changed.set_index(key_col).apply(
+                                lambda row: highlight_excel_diff(row, cols_to_compare, df1_idx, df2_idx), 
+                                axis=1
+                            ).values
+                            # Перенос лога в начало
+                            cols = ['LOG_ИЗМЕНЕНИЙ'] + [c for c in df_changed.columns if c != 'LOG_ИЗМЕНЕНИЙ']
+                            df_changed = df_changed[cols]
+
+                        result_dfs['Added'] = df_added
+                        result_dfs['Removed'] = df_removed
+                        result_dfs['Changed'] = df_changed
+                        
+                        t1, t2, t3 = st.tabs([f"🟢 Добавлено ({len(df_added)})", f"🔴 Удалено ({len(df_removed)})", f"🟡 Изменено ({len(df_changed)})"])
+                        with t1: st.dataframe(df_added, use_container_width=True)
+                        with t2: st.dataframe(df_removed, use_container_width=True)
+                        with t3: st.dataframe(df_changed, use_container_width=True)
+
+                else:
+                    # Сравнение множеств
+                    rows_old = set(tuple(x) for x in df1.to_numpy())
+                    rows_new = set(tuple(x) for x in df2.to_numpy())
+                    
+                    df_added = pd.DataFrame(list(rows_new - rows_old), columns=df2.columns)
+                    df_removed = pd.DataFrame(list(rows_old - rows_new), columns=df1.columns)
+                    
+                    result_dfs['Added_Rows'] = df_added
+                    result_dfs['Removed_Rows'] = df_removed
+
+                    c1, c2 = st.columns(2)
+                    with c1: 
+                        st.subheader("🟢 Новые строки")
+                        st.dataframe(df_added, use_container_width=True)
+                    with c2: 
+                        st.subheader("🔴 Пропавшие строки")
+                        st.dataframe(df_removed, use_container_width=True)
+
+                # Кнопка скачивания
+                if result_dfs:
+                    st.download_button(
+                        label="📥 Скачать результат (Excel)",
+                        data=to_excel(result_dfs),
+                        file_name="comparison_result.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="excel_download"
+                    )
+
+        except Exception as e:
+            st.error(f"Ошибка при обработке файлов: {e}")
