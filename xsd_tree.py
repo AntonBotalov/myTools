@@ -1,5 +1,8 @@
 """Разбор XSD-схемы в дерево, отрисовка в стиле XMLSpy и сопоставление с XML-документом."""
 import html
+import io
+import re
+import posixpath
 from collections import Counter
 
 from lxml import etree
@@ -9,6 +12,7 @@ XS = "{%s}" % XS_NS
 MAX_DEPTH = 40        # защита от слишком глубокой вложенности
 MAX_NODES = 20000     # защита от гигантских схем
 COMPOSITORS = ("sequence", "choice", "all")
+_NS_RE = re.compile(r"\{[^}]*\}")  # {http://...}имя → имя в подписях ошибок
 
 
 # --- Мелкие помощники ---
@@ -17,19 +21,18 @@ def _tag(el):
     return etree.QName(el).localname if isinstance(el.tag, str) else None
 
 
-def _local(qname):
-    return qname.split(":")[-1] if qname else None
+def _split(el, qname):
+    """QName из атрибута (type/ref/base) → (namespace, local) по nsmap элемента"""
+    prefix, local = qname.split(":", 1) if ":" in qname else (None, qname)
+    return el.nsmap.get(prefix) or "", local
 
 
 def _is_builtin(el, qname):
-    """Тип из пространства имён XMLSchema (xs:string, xs:date и т.п.)"""
-    prefix = qname.split(":")[0] if ":" in qname else None
-    return el.nsmap.get(prefix) == XS_NS
+    return _split(el, qname)[0] == XS_NS
 
 
 def _type_label(el, qname):
-    name = _local(qname)
-    return f"xs:{name}" if _is_builtin(el, qname) else name
+    return f"xs:{_split(el, qname)[1]}" if _is_builtin(el, qname) else qname
 
 
 def _doc(el):
@@ -48,34 +51,162 @@ def _max(value):
     return "∞" if value == "unbounded" else value
 
 
+# --- Пакет из нескольких XSD (импорты по относительным путям) ---
+
+def _norm(path):
+    return posixpath.normpath(path.replace("\\", "/")).lstrip("/")
+
+
+class XsdPackage:
+    """Набор XSD-файлов {путь: байты}. Импорты ищутся по относительному пути,
+    а если структура папок потерялась — по имени файла."""
+    BASE = "/__xsd__/"
+    REF_TAGS = ("import", "include", "redefine")
+
+    def __init__(self, files):
+        self.files = {_norm(k): v for k, v in files.items()}
+        self.by_name = {}
+        for p in self.files:
+            self.by_name.setdefault(posixpath.basename(p).lower(), []).append(p)
+        self._roots = {}
+
+    def lookup(self, path):
+        p = _norm(path)
+        if p in self.files:
+            return p
+        same = self.by_name.get(posixpath.basename(p).lower(), [])
+        return same[0] if same else None
+
+    def root(self, path):
+        if path not in self._roots:
+            try:
+                self._roots[path] = etree.fromstring(self.files[path].lstrip(), _parser())
+            except etree.XMLSyntaxError as e:
+                raise ValueError(f"{path}: файл не является корректным XML ({e})") from e
+        return self._roots[path]
+
+    def references(self, path):
+        """Файлы, на которые ссылается схема через import/include"""
+        refs = []
+        for ch in self.root(path):
+            loc = ch.get("schemaLocation") if _tag(ch) in self.REF_TAGS else None
+            if loc and "://" not in loc:
+                found = self.lookup(posixpath.join(posixpath.dirname(path), loc))
+                if found:
+                    refs.append(found)
+        return refs
+
+    def missing_references(self, main):
+        """schemaLocation, для которых файла в пакете нет"""
+        missing = []
+        for path in self.reachable(main):
+            for ch in self.root(path):
+                loc = ch.get("schemaLocation") if _tag(ch) in self.REF_TAGS else None
+                if loc and not self.lookup(posixpath.join(posixpath.dirname(path), loc)):
+                    missing.append(f"{path} → {loc}")
+        return missing
+
+    def reachable(self, main):
+        seen, stack = [], [main]
+        while stack:
+            p = stack.pop()
+            if p in seen:
+                continue
+            seen.append(p)
+            stack.extend(self.references(p))
+        return seen
+
+    def main_candidates(self):
+        """Главные схемы — те, на которые никто не ссылается. Сначала самые «связанные»."""
+        referenced = {r for p in self.files for r in self.references(p)}
+        cands = [p for p in self.files if p not in referenced] or list(self.files)
+        return sorted(cands, key=lambda p: (-len(self.reachable(p)), p))
+
+    def schema(self, main):
+        parser = _parser()
+        parser.resolvers.add(_PackageResolver(self))
+        doc = etree.parse(io.BytesIO(self.files[main].lstrip()), parser, base_url=self.BASE + main)
+        return etree.XMLSchema(doc)
+
+    def short_name(self, url):
+        if not url:
+            return ""
+        i = url.find(self.BASE)
+        return url[i + len(self.BASE):] if i >= 0 else url
+
+
+class _PackageResolver(etree.Resolver):
+    def __init__(self, package):
+        super().__init__()
+        self.package = package
+
+    def resolve(self, url, pubid, context):
+        found = self.package.lookup(self.package.short_name(url))
+        if found:
+            return self.resolve_string(self.package.files[found], context,
+                                       base_url=self.package.BASE + found)
+        # Неизвестный файл: не даём читать что-либо с диска сервера
+        return self.resolve_string(b"", context)
+
+
+def _parser():
+    return etree.XMLParser(resolve_entities=False, no_network=True)
+
+
 # --- Построение дерева по схеме ---
 
 class XsdTree:
-    def __init__(self, xsd_root):
-        self.index = {k: {} for k in ("element", "complexType", "simpleType",
-                                      "group", "attributeGroup", "attribute")}
-        for child in xsd_root:
-            tag = _tag(child)
-            if tag in self.index and child.get("name"):
-                self.index[tag][child.get("name")] = child
+    KINDS = ("element", "complexType", "simpleType", "group", "attributeGroup", "attribute")
+
+    def __init__(self, docs, main=None):
+        if not isinstance(docs, (list, tuple)):
+            docs = [docs]
+        self.main = main if main is not None else docs[0]
+        self.index = {k: {} for k in self.KINDS}
+        self.by_local = {k: {} for k in self.KINDS}
+        for root in docs:
+            tns = root.get("targetNamespace", "")
+            for child in root:
+                tag = _tag(child)
+                if tag in self.index and child.get("name"):
+                    key = (tns, child.get("name"))
+                    self.index[tag].setdefault(key, child)
+                    self.by_local[tag].setdefault(key[1], []).append(key)
         self.count = 0
         self.truncated = False
 
     @property
     def global_elements(self):
-        return list(self.index["element"])
+        return [c.get("name") for c in self.main if _tag(c) == "element" and c.get("name")]
 
     def build(self, root_name):
         self.count = 0
         self.truncated = False
-        return self._element(self.index["element"][root_name], "", 0, (), False)
+        key = (self.main.get("targetNamespace", ""), root_name)
+        return self._element(self.index["element"][key], "", 0, (), False)
+
+    def _find(self, kind, el, qname):
+        """Ищет глобальное определение по QName; при неудаче — по уникальному локальному имени"""
+        if not qname:
+            return None, None
+        key = _split(el, qname)
+        node = self.index[kind].get(key)
+        if node is None:
+            same = self.by_local[kind].get(key[1], [])
+            if len(same) == 1:
+                key = same[0]
+                node = self.index[kind][key]
+        return node, (key if node is not None else None)
 
     # Элемент
     def _element(self, el, parent_path, depth, type_stack, optional_ctx):
         self.count += 1
         ref = el.get("ref")
-        target = self.index["element"].get(_local(ref)) if ref else el
-        name = _local(ref) if ref else el.get("name", "?")
+        if ref:
+            target, _ = self._find("element", el, ref)
+            name = _split(el, ref)[1]
+        else:
+            target, name = el, el.get("name", "?")
         min_o = el.get("minOccurs", "1")
         max_o = el.get("maxOccurs", "1")
         path = f"{parent_path}/{name}" if parent_path else name
@@ -86,7 +217,7 @@ class XsdTree:
                     facets="", note="", attrs=[], children=[])
 
         if target is None:
-            node["note"] = "элемент описан во внешней схеме"
+            node["note"] = "элемент описан во внешней схеме, которой нет в пакете"
             return node
         if self.count > MAX_NODES:
             self.truncated = True
@@ -102,23 +233,22 @@ class XsdTree:
         elif inline_st is not None:
             node["facets"] = self._simple(inline_st)
         elif type_q:
-            lname = _local(type_q)
             node["type"] = _type_label(target, type_q)
-            if _is_builtin(target, type_q):
-                pass
-            elif lname in self.index["complexType"]:
-                node["named_complex"] = True
-                if lname in type_stack:
-                    node["note"] = "рекурсивный тип — содержимое показано выше по дереву"
-                elif depth >= MAX_DEPTH:
-                    node["note"] = "слишком глубокая вложенность"
+            if not _is_builtin(target, type_q):
+                ct, ckey = self._find("complexType", target, type_q)
+                st, _ = self._find("simpleType", target, type_q)
+                if ct is not None:
+                    node["named_complex"] = True
+                    if ckey in type_stack:
+                        node["note"] = "рекурсивный тип — содержимое показано выше по дереву"
+                    elif depth >= MAX_DEPTH:
+                        node["note"] = "слишком глубокая вложенность"
+                    else:
+                        self._content(ct, node, path, depth, type_stack + (ckey,))
+                elif st is not None:
+                    node["facets"] = self._simple(st)
                 else:
-                    self._content(self.index["complexType"][lname], node, path, depth,
-                                  type_stack + (lname,))
-            elif lname in self.index["simpleType"]:
-                node["facets"] = self._simple(self.index["simpleType"][lname])
-            else:
-                node["note"] = "тип описан во внешней схеме (xs:import / xs:include)"
+                    node["note"] = "тип не найден: нужен файл схемы из xs:import / xs:include"
         return node
 
     # Содержимое комплексного типа
@@ -139,22 +269,21 @@ class XsdTree:
                     if dtag not in ("extension", "restriction"):
                         continue
                     base = der.get("base")
-                    if base:
-                        bl = _local(base)
-                        if tag == "complexContent":
-                            if (dtag == "extension" and bl in self.index["complexType"]
-                                    and bl not in type_stack):
-                                self._content(self.index["complexType"][bl], node, path, depth,
-                                              type_stack + (bl,))
-                        else:
-                            if not node["type"]:
-                                node["type"] = _type_label(der, base)
-                            parts = []
-                            if bl in self.index["simpleType"]:
-                                parts.append(self._simple(self.index["simpleType"][bl]))
-                            if dtag == "restriction":
-                                parts.append(self._facets(der))
-                            node["facets"] = " · ".join(p for p in parts if p)
+                    if base and not _is_builtin(der, base):
+                        bct, bkey = self._find("complexType", der, base)
+                        bst, _ = self._find("simpleType", der, base)
+                        if bct is not None and bkey not in type_stack:
+                            # restriction в complexContent переописывает содержимое целиком
+                            if not (tag == "complexContent" and dtag == "restriction"):
+                                self._content(bct, node, path, depth, type_stack + (bkey,))
+                        elif bst is not None:
+                            node["facets"] = self._simple(bst)
+                    if tag == "simpleContent":
+                        if base and not node["type"]:
+                            node["type"] = _type_label(der, base)
+                        if dtag == "restriction":
+                            node["facets"] = " · ".join(
+                                p for p in (node["facets"], self._facets(der)) if p)
                     self._content(der, node, path, depth, type_stack)
             elif tag == "attribute":
                 node["attrs"].append(self._attr(ch, path))
@@ -189,21 +318,23 @@ class XsdTree:
         return node
 
     def _group(self, ref_el, path, depth, type_stack, optional_ctx):
-        gname = _local(ref_el.get("ref"))
-        gdef = self.index["group"].get(gname)
-        if gdef is None or gname in type_stack:
+        gdef, gkey = self._find("group", ref_el, ref_el.get("ref"))
+        if gdef is None or gkey in type_stack:
             return None
         for ch in gdef:
             if _tag(ch) in COMPOSITORS:
-                return self._compositor(ch, path, depth, type_stack + (gname,), optional_ctx,
+                return self._compositor(ch, path, depth, type_stack + (gkey,), optional_ctx,
                                         ref_el.get("minOccurs"), ref_el.get("maxOccurs"))
         return None
 
     # Атрибуты
     def _attr(self, a, path):
         ref = a.get("ref")
-        target = self.index["attribute"].get(_local(ref)) if ref else a
-        name = _local(ref) if ref else a.get("name", "?")
+        if ref:
+            target, _ = self._find("attribute", a, ref)
+            name = _split(a, ref)[1]
+        else:
+            target, name = a, a.get("name", "?")
         info = dict(name=name, required=a.get("use") == "required", type="", facets="",
                     doc=_doc(a) or _doc(target), path=f"{path}/@{name}")
         if target is not None:
@@ -213,16 +344,17 @@ class XsdTree:
                 info["facets"] = self._simple(st)
             elif t:
                 info["type"] = _type_label(target, t)
-                if _local(t) in self.index["simpleType"]:
-                    info["facets"] = self._simple(self.index["simpleType"][_local(t)])
+                if not _is_builtin(target, t):
+                    named, _ = self._find("simpleType", target, t)
+                    if named is not None:
+                        info["facets"] = self._simple(named)
         return info
 
     def _attr_group(self, ref_el, node, path, seen):
-        gname = _local(ref_el.get("ref"))
-        gdef = self.index["attributeGroup"].get(gname)
-        if gdef is None or gname in seen:
+        gdef, gkey = self._find("attributeGroup", ref_el, ref_el.get("ref"))
+        if gdef is None or gkey in seen:
             return
-        seen.add(gname)
+        seen.add(gkey)
         for ch in gdef:
             tag = _tag(ch)
             if tag == "attribute":
@@ -237,14 +369,15 @@ class XsdTree:
             parts = []
             base = r.get("base")
             if base:
-                bl = _local(base)
                 if _is_builtin(r, base):
-                    parts.append(f"xs:{bl}")
-                elif bl in self.index["simpleType"] and bl not in seen:
-                    inherited = self._simple(self.index["simpleType"][bl], seen + (bl,))
-                    parts.append(f"{bl} ({inherited})" if inherited else bl)
+                    parts.append(_type_label(r, base))
                 else:
-                    parts.append(bl)
+                    named, nkey = self._find("simpleType", r, base)
+                    if named is not None and nkey not in seen:
+                        inherited = self._simple(named, seen + (nkey,))
+                        parts.append(f"{base} ({inherited})" if inherited else base)
+                    else:
+                        parts.append(base)
             facets = self._facets(r)
             if facets:
                 parts.append(facets)
@@ -429,7 +562,7 @@ def _r_element(n, ctx, depth):
 
     body = ""
     if errs:
-        body += '<ul class="errs">' + "".join(f"<li>{e(m)}</li>" for m in errs) + "</ul>"
+        body += '<ul class="errs">' + "".join(f"<li>{e(_NS_RE.sub('', m))}</li>" for m in errs) + "</ul>"
     body += inner
 
     search = e(f'{n["name"]} {n["doc"]}'.lower(), quote=True)
