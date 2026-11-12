@@ -10,7 +10,9 @@ from jwt.exceptions import InvalidTokenError
 import uuid
 import base64
 import io
-import pandas as pd  # Добавлена библиотека pandas
+import re
+import pandas as pd
+from lxml import etree  # Для валидации XML по XSD
 
 st.set_page_config(page_title="Утилиты для текста и данных", layout="wide")
 
@@ -76,23 +78,86 @@ def highlight_excel_diff(row, common_cols, df_old_indexed, df_new_indexed):
             changes.append(f"{col}: '{val_old}' -> '{val_new}'")
     return "; ".join(changes)
 
+# --- Функции для валидации XML ---
+
+XML_DECLARATION_RE = re.compile(r'^\s*<\?xml[^>]*\?>', re.IGNORECASE)
+
+def xml_input_block(title, key_prefix, file_types):
+    """Блок ввода: файл или текст. Возвращает байты документа или None."""
+    st.subheader(title)
+    mode = st.radio(
+        "Способ загрузки:",
+        ["📁 Файл", "📝 Текст"],
+        key=f"{key_prefix}_mode",
+        horizontal=True,
+    )
+    if mode == "📁 Файл":
+        uploaded = st.file_uploader("Выберите файл", type=file_types, key=f"{key_prefix}_file")
+        if uploaded is not None:
+            # Байты из файла передаём как есть — lxml сам учтёт кодировку из декларации
+            return uploaded.getvalue().lstrip()
+        return None
+    else:
+        text = st.text_area("Вставьте содержимое", height=350, key=f"{key_prefix}_text")
+        if text.strip():
+            # Текст из поля уже в Unicode: убираем декларацию (encoding="windows-1251" и т.п.),
+            # чтобы она не конфликтовала с кодировкой UTF-8
+            text = XML_DECLARATION_RE.sub('', text, count=1)
+            return text.strip().encode('utf-8')
+        return None
+
+def safe_parser():
+    """Парсер без загрузки внешних сущностей и сети (защита от XXE)"""
+    return etree.XMLParser(resolve_entities=False, no_network=True, huge_tree=False)
+
+def errors_to_df(error_log):
+    rows = [{
+        "Строка": e.line,
+        "Колонка": e.column,
+        "Уровень": e.level_name,
+        "Сообщение": e.message,
+    } for e in error_log]
+    return pd.DataFrame(rows)
+
+def show_error_context(xml_bytes, errors_df, max_items=20):
+    """Показывает строки XML, в которых найдены ошибки"""
+    try:
+        lines = xml_bytes.decode('utf-8', errors='replace').splitlines()
+    except Exception:
+        return
+    shown = 0
+    for line_no in sorted(set(errors_df["Строка"].dropna().astype(int))):
+        if shown >= max_items:
+            st.caption(f"Показаны первые {max_items} строк с ошибками.")
+            break
+        if 1 <= line_no <= len(lines):
+            start = max(line_no - 2, 1)
+            end = min(line_no + 1, len(lines))
+            snippet = "\n".join(
+                f"{'>>' if i == line_no else '  '} {i:>5} | {lines[i - 1]}"
+                for i in range(start, end + 1)
+            )
+            st.code(snippet, language="")
+            shown += 1
+
 # --- Основной интерфейс ---
 
 tabs = st.tabs([
-    "🎲 Генератор", 
-    "🔠 Регистры текста", 
-    "🧮 Подсчёт символов", 
-    "⚔️ Сравнение строк", 
-    "🔐 JWT кодер", 
+    "🎲 Генератор",
+    "🔠 Регистры текста",
+    "🧮 Подсчёт символов",
+    "⚔️ Сравнение строк",
+    "🔐 JWT кодер",
     "📁 Base64 конвертер",
-    "📊 Сравнение Excel"  # Новая вкладка
+    "📊 Сравнение Excel",
+    "✅ Валидация XML",  # Новая вкладка
 ])
 
 # 1. Генератор
 with tabs[0]:
     st.header("🎲 Генератор текста по символам")
     generator_type = st.radio("Выберите тип генератора:", ["Случайные символы", "GUID"])
-    
+
     if generator_type == "Случайные символы":
         alphabet_type = st.radio("Выберите тип символов:", ["Кириллица", "Латиница", "Гибрид"])
         use_special = st.checkbox("Добавить спецсимволы и цифры")
@@ -117,7 +182,7 @@ with tabs[0]:
         if st.session_state.generated_text:
             st.code(st.session_state.generated_text, language="")
             copy_to_clipboard(st.session_state.generated_text, "copy-btn-gen")
-    
+
     else:  # Генерация GUID
         if st.button("🎲 Сгенерировать GUID"):
             generated_guid = str(uuid.uuid4())
@@ -153,7 +218,7 @@ with tabs[2]:
     st.header("🧮 Подсчёт количества символов")
     count_text = st.text_area("Введите текст для подсчёта:", height=200, key="count_text_input")
     col1, col2, col3, col4 = st.columns(4)
-    
+
     with col1:
         if st.button("📊 Посчитать"):
             if count_text:
@@ -223,10 +288,10 @@ with tabs[4]:
 # 6. Base64
 with tabs[5]:
     st.header("📁 Base64 конвертер")
-    
-    conversion_type = st.radio("Выберите тип конвертации:", 
+
+    conversion_type = st.radio("Выберите тип конвертации:",
                               ["Текст в Base64", "Base64 в текст", "Файл в Base64", "Base64 в файл"])
-    
+
     if conversion_type == "Текст в Base64":
         text_to_encode = st.text_area("Введите текст для кодирования:", height=150)
         if st.button("🔒 Кодировать в Base64"):
@@ -236,7 +301,7 @@ with tabs[5]:
                 copy_to_clipboard(encoded, "copy-base64-encode")
             else:
                 st.warning("Введите текст для кодирования")
-    
+
     elif conversion_type == "Base64 в текст":
         base64_to_decode = st.text_area("Введите Base64 для декодирования:", height=150)
         if st.button("🔓 Декодировать из Base64"):
@@ -249,7 +314,7 @@ with tabs[5]:
                     st.error(f"Ошибка декодирования: {str(e)}")
             else:
                 st.warning("Введите Base64 строку для декодирования")
-    
+
     elif conversion_type == "Файл в Base64":
         uploaded_file = st.file_uploader("Загрузите файл для кодирования", type=None)
         if uploaded_file is not None:
@@ -258,18 +323,18 @@ with tabs[5]:
                 encoded_file = base64.b64encode(file_bytes).decode('utf-8')
                 st.text_area("Base64 представление файла:", encoded_file, height=200)
                 copy_to_clipboard(encoded_file, "copy-file-base64")
-                
+
                 st.download_button(
                     label="📥 Скачать Base64 как файл",
                     data=encoded_file,
                     file_name=f"{uploaded_file.name}.base64.txt",
                     mime="text/plain"
                 )
-    
+
     elif conversion_type == "Base64 в файл":
         base64_file_input = st.text_area("Введите Base64 строку файла:", height=150)
         original_filename = st.text_input("Имя файла для сохранения (с расширением):", "decoded_file.bin")
-        
+
         if st.button("💾 Восстановить файл из Base64"):
             if base64_file_input:
                 try:
@@ -286,7 +351,7 @@ with tabs[5]:
             else:
                 st.warning("Введите Base64 строку файла")
 
-# 7. Сравнение Excel (НОВОЕ)
+# 7. Сравнение Excel
 with tabs[6]:
     st.header("📊 Сравнение Excel таблиц")
     st.markdown("Загрузите два файла, выберите ключ (ID/Артикул) и получите отчет о добавленных, удаленных и измененных строках.")
@@ -299,12 +364,11 @@ with tabs[6]:
 
     if file1 and file2:
         try:
-            # Чтение имен листов
             xl1 = pd.ExcelFile(file1)
             xl2 = pd.ExcelFile(file2)
-            
+
             common_sheets = list(set(xl1.sheet_names) & set(xl2.sheet_names))
-            
+
             if common_sheets:
                 selected_sheet = st.selectbox("Выберите лист для сравнения", common_sheets, key="excel_sheet_select")
                 df1 = pd.read_excel(file1, sheet_name=selected_sheet)
@@ -317,81 +381,71 @@ with tabs[6]:
             df1 = df1.fillna("")
             df2 = df2.fillna("")
 
-            # Выбор ключа
             common_columns = list(set(df1.columns) & set(df2.columns))
             key_col = st.selectbox(
-                "Выберите ключевую колонку для сверки (ID, Артикул)", 
+                "Выберите ключевую колонку для сверки (ID, Артикул)",
                 options=["-- Без ключа (сравнение строк) --"] + common_columns,
                 key="excel_key_col"
             )
 
             if st.button("🚀 Сравнить файлы", key="excel_btn_compare", type="primary"):
                 result_dfs = {}
-                
+
                 if key_col != "-- Без ключа (сравнение строк) --":
-                    # Сравнение по ключу
                     if not df1[key_col].is_unique or not df2[key_col].is_unique:
                         st.error(f"Ошибка: значения в колонке '{key_col}' не уникальны!")
                     else:
                         df1_idx = df1.set_index(key_col)
                         df2_idx = df2.set_index(key_col)
 
-                        # Удаленные
                         removed_keys = df1_idx.index.difference(df2_idx.index)
                         df_removed = df1_idx.loc[removed_keys].reset_index()
-                        
-                        # Добавленные
+
                         added_keys = df2_idx.index.difference(df1_idx.index)
                         df_added = df2_idx.loc[added_keys].reset_index()
-                        
-                        # Измененные
+
                         common_keys = df1_idx.index.intersection(df2_idx.index)
                         cols_to_compare = [c for c in common_columns if c != key_col]
-                        
-                        # Маска изменений
+
                         mask_diff = (df1_idx.loc[common_keys, cols_to_compare] != df2_idx.loc[common_keys, cols_to_compare]).any(axis=1)
                         changed_keys = common_keys[mask_diff]
                         df_changed = df2_idx.loc[changed_keys].reset_index()
 
-                        # Детализация
                         if not df_changed.empty:
                             df_changed['LOG_ИЗМЕНЕНИЙ'] = df_changed.set_index(key_col).apply(
-                                lambda row: highlight_excel_diff(row, cols_to_compare, df1_idx, df2_idx), 
+                                lambda row: highlight_excel_diff(row, cols_to_compare, df1_idx, df2_idx),
                                 axis=1
                             ).values
-                            # Перенос лога в начало
                             cols = ['LOG_ИЗМЕНЕНИЙ'] + [c for c in df_changed.columns if c != 'LOG_ИЗМЕНЕНИЙ']
                             df_changed = df_changed[cols]
 
                         result_dfs['Added'] = df_added
                         result_dfs['Removed'] = df_removed
                         result_dfs['Changed'] = df_changed
-                        
+
                         t1, t2, t3 = st.tabs([f"🟢 Добавлено ({len(df_added)})", f"🔴 Удалено ({len(df_removed)})", f"🟡 Изменено ({len(df_changed)})"])
                         with t1: st.dataframe(df_added, use_container_width=True)
                         with t2: st.dataframe(df_removed, use_container_width=True)
                         with t3: st.dataframe(df_changed, use_container_width=True)
 
                 else:
-                    # Сравнение множеств
                     rows_old = set(tuple(x) for x in df1.to_numpy())
                     rows_new = set(tuple(x) for x in df2.to_numpy())
-                    
+
                     df_added = pd.DataFrame(list(rows_new - rows_old), columns=df2.columns)
                     df_removed = pd.DataFrame(list(rows_old - rows_new), columns=df1.columns)
-                    
+
                     result_dfs['Added_Rows'] = df_added
                     result_dfs['Removed_Rows'] = df_removed
 
                     c1, c2 = st.columns(2)
-                    with c1: 
+                    with c1:
                         st.subheader("🟢 Новые строки")
                         st.dataframe(df_added, use_container_width=True)
-                    with c2: 
+                    with c2:
                         st.subheader("🔴 Пропавшие строки")
                         st.dataframe(df_removed, use_container_width=True)
 
-                # Кнопка скачивания
                 if result_dfs:
                     st.download_button(
                         label="📥 Скачать результат (Excel)",
@@ -403,3 +457,65 @@ with tabs[6]:
 
         except Exception as e:
             st.error(f"Ошибка при обработке файлов: {e}")
+
+# 8. Валидация XML по XSD (НОВОЕ)
+with tabs[7]:
+    st.header("✅ Валидация XML по XSD схеме")
+    st.markdown("Загрузите XSD схему и XML документ — файлом или вставкой текста.")
+
+    col_xsd, col_xml = st.columns(2)
+    with col_xsd:
+        xsd_bytes = xml_input_block("📐 XSD схема", "xsd", ["xsd", "xml"])
+    with col_xml:
+        xml_bytes = xml_input_block("📄 XML документ", "xml", ["xml"])
+
+    if st.button("🔍 Проверить XML", key="xml_validate_btn", type="primary"):
+        if not xsd_bytes:
+            st.warning("Загрузите или вставьте XSD схему")
+        elif not xml_bytes:
+            st.warning("Загрузите или вставьте XML документ")
+        else:
+            schema = None
+
+            # 1. Разбор и компиляция схемы
+            try:
+                xsd_doc = etree.fromstring(xsd_bytes, safe_parser())
+                schema = etree.XMLSchema(xsd_doc)
+            except etree.XMLSyntaxError as e:
+                st.error(f"❌ XSD не является корректным XML: {e}")
+            except etree.XMLSchemaParseError as e:
+                st.error("❌ Ошибка в XSD схеме")
+                st.dataframe(errors_to_df(e.error_log), use_container_width=True, hide_index=True)
+                st.info("Если схема использует xs:include / xs:import с внешними файлами, "
+                        "их нужно встроить в одну схему — внешние ссылки здесь не загружаются.")
+
+            # 2. Разбор XML
+            xml_doc = None
+            if schema is not None:
+                try:
+                    xml_doc = etree.fromstring(xml_bytes, safe_parser())
+                except etree.XMLSyntaxError as e:
+                    st.error("❌ XML не является корректно сформированным (well-formed)")
+                    syntax_df = errors_to_df(e.error_log)
+                    st.dataframe(syntax_df, use_container_width=True, hide_index=True)
+                    show_error_context(xml_bytes, syntax_df)
+
+            # 3. Валидация
+            if schema is not None and xml_doc is not None:
+                if schema.validate(xml_doc):
+                    st.success("✅ XML соответствует XSD схеме")
+                else:
+                    errors_df = errors_to_df(schema.error_log)
+                    st.error(f"❌ XML не прошёл валидацию. Найдено ошибок: {len(errors_df)}")
+                    st.dataframe(errors_df, use_container_width=True, hide_index=True)
+
+                    with st.expander("📍 Фрагменты XML с ошибками"):
+                        show_error_context(xml_bytes, errors_df)
+
+                    st.download_button(
+                        label="📥 Скачать список ошибок (CSV)",
+                        data=errors_df.to_csv(index=False, sep=';').encode('utf-8-sig'),
+                        file_name="xml_validation_errors.csv",
+                        mime="text/csv",
+                        key="xml_errors_download",
+                    )
