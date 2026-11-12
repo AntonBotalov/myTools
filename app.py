@@ -11,6 +11,10 @@ import uuid
 import base64
 import io
 import re
+import os
+import shutil
+import subprocess
+import tempfile
 import zipfile
 import pandas as pd
 from lxml import etree  # Для валидации XML по XSD
@@ -115,8 +119,105 @@ def safe_parser():
 
 MAX_ARCHIVE_BYTES = 50 * 1024 * 1024
 
+ARCHIVE_TIMEOUT = 60  # секунд на распаковку одного архива
+
+NO_ARCHIVE_TOOL = ("для RAR и 7z нужна программа распаковки, а на этом компьютере её не нашлось. "
+                   "Windows: установите WinRAR или 7-Zip. Linux: пакет libarchive-tools (bsdtar) "
+                   "или unar; для Streamlit Cloud добавьте строку libarchive-tools в packages.txt. "
+                   "Либо перепакуйте схему в ZIP.")
+
+def _is_bsdtar(cmd):
+    try:
+        r = subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=10)
+        return "bsdtar" in (r.stdout + r.stderr).lower()
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+@st.cache_resource(show_spinner=False)
+def archive_tools():
+    """Программы распаковки RAR/7z, найденные на этом компьютере: [(вид, путь)]"""
+    found = []
+
+    def add(kind, path):
+        if path and (kind, path) not in found:
+            found.append((kind, path))
+
+    add("unrar", shutil.which("unrar"))
+    add("7z", shutil.which("7z") or shutil.which("7zz"))
+    if os.name == "nt":
+        for base in filter(None, (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"))):
+            for kind, rel in (("unrar", r"WinRAR\UnRAR.exe"), ("7z", r"7-Zip\7z.exe")):
+                path = os.path.join(base, rel)
+                if os.path.isfile(path):
+                    add(kind, path)
+    add("bsdtar", shutil.which("bsdtar"))
+    tar = shutil.which("tar")
+    if tar and _is_bsdtar(tar):  # встроенный tar в Windows 10/11 — это bsdtar, он умеет RAR
+        add("bsdtar", tar)
+    add("unar", shutil.which("unar"))
+    return found
+
+def _archive_cmd(kind, tool, archive, out):
+    return {
+        "unrar": [tool, "x", "-y", "-p-", "-idq", archive, out + os.sep],
+        "7z": [tool, "x", "-y", "-p", f"-o{out}", archive],
+        "bsdtar": [tool, "-x", "-f", archive, "-C", out],
+        "unar": [tool, "-q", "-f", "-p", "", "-o", out, archive],
+    }[kind]
+
+def _collect_xsd(root):
+    """Все .xsd из распакованной папки (без симлинков и выходов за её пределы)"""
+    files, total = {}, 0
+    root_real = os.path.realpath(root)
+    for dirpath, _, names in os.walk(root):
+        for name in sorted(names):
+            path = os.path.join(dirpath, name)
+            if not name.lower().endswith(".xsd") or os.path.islink(path):
+                continue
+            if not os.path.realpath(path).startswith(root_real + os.sep):
+                continue
+            total += os.path.getsize(path)
+            if total > MAX_ARCHIVE_BYTES:
+                return files
+            with open(path, "rb") as f:
+                files[os.path.relpath(path, root).replace(os.sep, "/")] = f.read()
+    return files
+
+def extract_archive(data, filename):
+    """RAR / 7z → ({путь: байты} для .xsd, ошибка). Распаковывает внешней программой во временную папку."""
+    ext = os.path.splitext(filename)[1].lower()
+    tools = [(k, t) for k, t in archive_tools() if not (ext == ".7z" and k == "unrar")]
+    if not tools:
+        return {}, NO_ARCHIVE_TOOL
+    errors = []
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = os.path.join(tmp, "upload" + ext)
+        with open(archive, "wb") as f:
+            f.write(data)
+        for i, (kind, tool) in enumerate(tools):
+            out = os.path.join(tmp, f"out{i}")
+            os.makedirs(out)
+            try:
+                r = subprocess.run(_archive_cmd(kind, tool, archive, out), stdin=subprocess.DEVNULL,
+                                   capture_output=True, timeout=ARCHIVE_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                errors.append(f"{kind}: распаковка дольше {ARCHIVE_TIMEOUT} с")
+                continue
+            except OSError as e:
+                errors.append(f"{kind}: {e}")
+                continue
+            files = _collect_xsd(out)
+            if files:
+                return files, ""
+            detail = (r.stderr or r.stdout).decode("utf-8", errors="replace").strip()
+            if r.returncode == 0 and not detail:
+                return {}, "в архиве нет .xsd файлов"
+            errors.append(f"{kind}: {detail[:200] or 'не удалось распаковать'}")
+    hint = " Возможно, архив защищён паролем или повреждён." if errors else ""
+    return {}, "не удалось распаковать (" + "; ".join(errors) + ")." + hint
+
 def read_xsd_uploads(uploads):
-    """Загруженные XSD и ZIP-архивы → ({путь: байты}, предупреждения). Из архива берутся только .xsd"""
+    """Загруженные XSD и архивы ZIP / RAR / 7z → ({путь: байты}, предупреждения). Из архивов берутся только .xsd"""
     files, warnings = {}, []
     for up in uploads:
         low = up.name.lower()
@@ -142,9 +243,10 @@ def read_xsd_uploads(uploads):
             except zipfile.BadZipFile:
                 warnings.append(f"{up.name}: не удалось открыть ZIP-архив")
         elif low.endswith((".rar", ".7z")):
-            fmt = low.rsplit(".", 1)[1].upper()
-            warnings.append(f"{up.name}: формат {fmt} не поддерживается. Перепакуйте схему в ZIP "
-                            "или выберите сразу все .xsd файлы из распакованной папки.")
+            extracted, error = extract_archive(up.getvalue(), low)
+            if error:
+                warnings.append(f"{up.name}: {error}")
+            files.update(extracted)
         else:
             files[up.name] = up.getvalue()
     return files, warnings
@@ -152,14 +254,14 @@ def read_xsd_uploads(uploads):
 def xsd_input_block():
     """Ввод XSD: файлы / ZIP или текст. Возвращает {путь: байты} или None."""
     st.subheader("📐 XSD схема")
-    mode = st.radio("Способ загрузки:", ["📁 Файлы или ZIP", "📝 Текст"],
+    mode = st.radio("Способ загрузки:", ["📁 Файлы или архив", "📝 Текст"],
                     key="xsd_mode", horizontal=True)
-    if mode == "📁 Файлы или ZIP":
+    if mode == "📁 Файлы или архив":
         uploads = st.file_uploader(
-            "Один XSD, все XSD схемы сразу или ZIP-архив",
+            "Один XSD, все XSD схемы сразу или архив (ZIP, RAR, 7z)",
             type=["xsd", "xml", "zip", "rar", "7z"], accept_multiple_files=True, key="xsd_files",
             help="Если схема подключает другие файлы через xs:import / xs:include, "
-                 "загрузите их все вместе или одним ZIP-архивом.")
+                 "загрузите их все вместе или одним архивом.")
         if not uploads:
             return None
         files, warnings = read_xsd_uploads(uploads)
@@ -622,7 +724,7 @@ def xml_validation_tab():
         shown = "\n".join(f"- `{m}`" for m in missing[:8])
         more = f"\n- … и ещё {len(missing) - 8}" if len(missing) > 8 else ""
         st.warning("Схема ссылается на файлы, которых нет среди загруженных — "
-                   "добавьте их или загрузите всю папку ZIP-архивом:\n" + shown + more)
+                   "добавьте их или загрузите всю папку архивом:\n" + shown + more)
 
     check = run_xml_check(xsd_files, main, xml_bytes) if xml_bytes else None
     rows = check["rows"] if check else []
