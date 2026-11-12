@@ -12,7 +12,7 @@ XS = "{%s}" % XS_NS
 MAX_DEPTH = 40        # защита от слишком глубокой вложенности
 MAX_NODES = 20000     # защита от гигантских схем
 COMPOSITORS = ("sequence", "choice", "all")
-_NS_RE = re.compile(r"\{[^}]*\}")  # {http://...}имя → имя в подписях ошибок
+_NS_RE = re.compile(r"\{[^}'\s]*\}")  # {http://...}имя → имя в подписях ошибок
 
 
 # --- Мелкие помощники ---
@@ -418,6 +418,40 @@ class XsdTree:
         return " · ".join(parts)
 
 
+def element_docs(schema_roots):
+    """{локальное имя элемента: описание} по всем файлам схемы — для подсказок в ошибках"""
+    docs = {}
+    for root in schema_roots:
+        for el in root.iter(f"{XS}element"):
+            name = el.get("name")
+            if name and name not in docs:
+                d = _doc(el)
+                if d:
+                    docs[name] = d if len(d) <= 80 else d[:77] + "…"
+    return docs
+
+
+def simple_type_bases(schema_roots):
+    """{имя простого типа: встроенный тип, от которого он происходит (xs:decimal и т.п.)}"""
+    defs = {}
+    for root in schema_roots:
+        for st in root.iter(f"{XS}simpleType"):
+            r = st.find(f"{XS}restriction")
+            if st.get("name") and r is not None and r.get("base"):
+                defs.setdefault(st.get("name"), (r, r.get("base")))
+    bases = {}
+    for name in defs:
+        seen, cur = set(), name
+        while cur in defs and cur not in seen:
+            seen.add(cur)
+            el, base = defs[cur]
+            if _is_builtin(el, base):
+                bases[name] = _type_label(el, base)
+                break
+            cur = _split(el, base)[1]
+    return bases
+
+
 # --- Анализ XML ---
 
 def local_path(el):
@@ -562,7 +596,7 @@ def _r_element(n, ctx, depth):
 
     body = ""
     if errs:
-        body += '<ul class="errs">' + "".join(f"<li>{e(_NS_RE.sub('', m))}</li>" for m in errs) + "</ul>"
+        body += '<ul class="errs">' + "".join(_r_error(m) for m in errs) + "</ul>"
     body += inner
 
     search = e(f'{n["name"]} {n["doc"]}'.lower(), quote=True)
@@ -572,6 +606,18 @@ def _r_element(n, ctx, depth):
         return (f'<details class="{cls}" data-s="{search}"{is_open}><summary>'
                 f'<div class="head">{head}</div>{sub}</summary>{body}</details>')
     return f'<div class="{cls} leaf" data-s="{search}"><div class="head">{head}</div>{sub}</div>'
+
+
+def _r_error(err):
+    """Ошибка в дереве: объяснение и совет, исходный текст валидатора — мелко"""
+    e = html.escape
+    if isinstance(err, str):
+        return f"<li>{e(_NS_RE.sub('', err))}</li>"
+    raw = f'<div class="raw">{e(_NS_RE.sub("", err.get("raw", "")))}</div>'
+    if not err.get("problem"):
+        return f'<li>{e(_NS_RE.sub("", err.get("raw", "")))}</li>'
+    fix = f'<div class="fix">✏️ {e(err["fix"])}</div>' if err.get("fix") else ""
+    return f'<li><b>{e(err["problem"])}</b>{fix}{raw}</li>'
 
 
 def render_tree(root_node, presence=None, errors=None):
@@ -644,6 +690,10 @@ border-radius:10px;padding:0 8px;background:#f6f8fa}
 .has-err>summary .box,.has-err.leaf .box,.miss>summary .box,.miss.leaf .box{border-color:var(--bad);background:var(--bad-bg)}
 .absent>summary .box,.absent.leaf .box{opacity:.55}
 .errs{margin:2px 0 4px 18px;padding-left:16px;color:var(--bad);font-size:12px}
+.errs li{margin-bottom:4px}
+.errs b{font-weight:600}
+.fix{color:#1f2328;margin-top:1px}
+.raw{color:#8a94a0;font-size:11px;margin-top:1px}
 .hit>summary .box,.hit.leaf .box,.attr.hit .aname{outline:2px solid var(--hit);outline-offset:1px}
 </style></head><body>
 <div class="bar"><input id="q" placeholder="Поиск по имени или описанию…"><span id="cnt"></span>
