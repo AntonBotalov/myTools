@@ -13,6 +13,8 @@ import io
 import re
 import pandas as pd
 from lxml import etree  # Для валидации XML по XSD
+from xsd_tree import (XsdTree, render_tree, xml_presence, collect_namespaces,
+                      error_element_path)
 
 st.set_page_config(page_title="Утилиты для текста и данных", layout="wide")
 
@@ -110,14 +112,64 @@ def safe_parser():
     """Парсер без загрузки внешних сущностей и сети (защита от XXE)"""
     return etree.XMLParser(resolve_entities=False, no_network=True, huge_tree=False)
 
-def errors_to_df(error_log):
-    rows = [{
-        "Строка": e.line,
-        "Колонка": e.column,
-        "Уровень": e.level_name,
-        "Сообщение": e.message,
-    } for e in error_log]
-    return pd.DataFrame(rows)
+def log_rows(error_log, xml_root=None):
+    """Превращает лог ошибок lxml в список словарей (для таблицы и кеша)"""
+    ns = collect_namespaces(xml_root) if xml_root is not None else {}
+    rows = []
+    for e in error_log:
+        row = {"Строка": e.line, "Колонка": e.column, "Уровень": e.level_name}
+        if xml_root is not None:
+            row["Элемент"] = error_element_path(e, xml_root, ns)
+        row["Сообщение"] = e.message
+        rows.append(row)
+    return rows
+
+@st.cache_data(show_spinner=False, max_entries=10)
+def run_xml_check(xsd_bytes, xml_bytes):
+    """Разбор XML, компиляция схемы и валидация. Результат — простые данные для кеша."""
+    res = {"stage": "", "msg": "", "rows": [], "presence": None, "err_by_path": {}, "xml_root": None}
+
+    # XML разбираем первым: присутствие элементов нужно дереву даже при ошибке в схеме
+    try:
+        xml_doc = etree.fromstring(xml_bytes, safe_parser())
+    except etree.XMLSyntaxError as e:
+        res.update(stage="xml_syntax", rows=log_rows(e.error_log))
+        return res
+    res["presence"] = xml_presence(xml_doc)
+    res["xml_root"] = etree.QName(xml_doc).localname
+
+    try:
+        schema = etree.XMLSchema(etree.fromstring(xsd_bytes, safe_parser()))
+    except etree.XMLSyntaxError as e:
+        res.update(stage="xsd_syntax", msg=str(e))
+        return res
+    except etree.XMLSchemaParseError as e:
+        res.update(stage="xsd_schema", rows=log_rows(e.error_log))
+        return res
+
+    if schema.validate(xml_doc):
+        res["stage"] = "ok"
+    else:
+        rows = log_rows(schema.error_log, xml_doc)
+        err_by_path = {}
+        for r in rows:
+            if r["Элемент"]:
+                err_by_path.setdefault(r["Элемент"], []).append(r["Сообщение"])
+        res.update(stage="invalid", rows=rows, err_by_path=err_by_path)
+    return res
+
+@st.cache_data(show_spinner=False, max_entries=10)
+def xsd_global_elements(xsd_bytes):
+    """Глобальные элементы схемы — кандидаты в корень. Возвращает (список, ошибка)."""
+    try:
+        return XsdTree(etree.fromstring(xsd_bytes, safe_parser())).global_elements, ""
+    except etree.XMLSyntaxError as e:
+        return [], f"XSD не является корректным XML: {e}"
+
+@st.cache_data(show_spinner=False, max_entries=10)
+def build_xsd_tree(xsd_bytes, root_name):
+    tree = XsdTree(etree.fromstring(xsd_bytes, safe_parser()))
+    return tree.build(root_name), tree.truncated
 
 def show_error_context(xml_bytes, errors_df, max_items=20):
     """Показывает строки XML, в которых найдены ошибки"""
@@ -458,10 +510,11 @@ with tabs[6]:
         except Exception as e:
             st.error(f"Ошибка при обработке файлов: {e}")
 
-# 8. Валидация XML по XSD (НОВОЕ)
+# 8. Валидация XML по XSD
 with tabs[7]:
     st.header("✅ Валидация XML по XSD схеме")
-    st.markdown("Загрузите XSD схему и XML документ — файлом или вставкой текста.")
+    st.markdown("Загрузите XSD схему — появится её структура. Добавьте XML, чтобы проверить его по схеме "
+                "и увидеть в дереве, каких элементов не хватает и где ошибки.")
 
     col_xsd, col_xml = st.columns(2)
     with col_xsd:
@@ -469,53 +522,78 @@ with tabs[7]:
     with col_xml:
         xml_bytes = xml_input_block("📄 XML документ", "xml", ["xml"])
 
-    if st.button("🔍 Проверить XML", key="xml_validate_btn", type="primary"):
-        if not xsd_bytes:
-            st.warning("Загрузите или вставьте XSD схему")
-        elif not xml_bytes:
-            st.warning("Загрузите или вставьте XML документ")
-        else:
-            schema = None
+    if not xsd_bytes:
+        st.info("Загрузите или вставьте XSD схему")
+    else:
+        check = run_xml_check(xsd_bytes, xml_bytes) if xml_bytes else None
+        rows = check["rows"] if check else []
 
-            # 1. Разбор и компиляция схемы
-            try:
-                xsd_doc = etree.fromstring(xsd_bytes, safe_parser())
-                schema = etree.XMLSchema(xsd_doc)
-            except etree.XMLSyntaxError as e:
-                st.error(f"❌ XSD не является корректным XML: {e}")
-            except etree.XMLSchemaParseError as e:
-                st.error("❌ Ошибка в XSD схеме")
-                st.dataframe(errors_to_df(e.error_log), use_container_width=True, hide_index=True)
+        # Итог проверки
+        if check:
+            stage = check["stage"]
+            if stage == "ok":
+                st.success("✅ XML соответствует XSD схеме")
+            elif stage == "invalid":
+                st.error(f"❌ XML не прошёл валидацию. Найдено ошибок: {len(rows)}")
+            elif stage == "xml_syntax":
+                st.error("❌ XML не является корректно сформированным (well-formed)")
+            elif stage == "xsd_syntax":
+                st.error(f"❌ XSD не является корректным XML: {check['msg']}")
+            elif stage == "xsd_schema":
+                st.error("❌ Ошибка в XSD схеме — проверить XML по ней нельзя")
                 st.info("Если схема использует xs:include / xs:import с внешними файлами, "
                         "их нужно встроить в одну схему — внешние ссылки здесь не загружаются.")
 
-            # 2. Разбор XML
-            xml_doc = None
-            if schema is not None:
-                try:
-                    xml_doc = etree.fromstring(xml_bytes, safe_parser())
-                except etree.XMLSyntaxError as e:
-                    st.error("❌ XML не является корректно сформированным (well-formed)")
-                    syntax_df = errors_to_df(e.error_log)
-                    st.dataframe(syntax_df, use_container_width=True, hide_index=True)
-                    show_error_context(xml_bytes, syntax_df)
+        tab_tree, tab_errors = st.tabs(["🌳 Структура схемы", f"📋 Ошибки ({len(rows)})"])
 
-            # 3. Валидация
-            if schema is not None and xml_doc is not None:
-                if schema.validate(xml_doc):
-                    st.success("✅ XML соответствует XSD схеме")
+        with tab_tree:
+            roots, xsd_err = xsd_global_elements(xsd_bytes)
+            if xsd_err:
+                st.error(xsd_err)
+            elif not roots:
+                st.warning("В схеме нет глобальных элементов (xs:element верхнего уровня) — "
+                           "нечего показать в качестве корня.")
+            else:
+                xml_root = check["xml_root"] if check else None
+                default_idx = roots.index(xml_root) if xml_root in roots else 0
+                if len(roots) > 1:
+                    root_name = st.selectbox("Корневой элемент", roots, index=default_idx,
+                                             key="xsd_tree_root")
                 else:
-                    errors_df = errors_to_df(schema.error_log)
-                    st.error(f"❌ XML не прошёл валидацию. Найдено ошибок: {len(errors_df)}")
-                    st.dataframe(errors_df, use_container_width=True, hide_index=True)
+                    root_name = roots[0]
 
+                tree_node, truncated = build_xsd_tree(xsd_bytes, root_name)
+                presence = check["presence"] if check else None
+                err_by_path = check["err_by_path"] if check else {}
+                components.html(render_tree(tree_node, presence, err_by_path),
+                                height=720, scrolling=True)
+
+                if truncated:
+                    st.caption("Схема очень большая — дерево показано не полностью.")
+                if xml_root and xml_root != root_name:
+                    st.caption(f"Корень XML — «{xml_root}», а в дереве выбран «{root_name}»: "
+                               "отметки присутствия могут не совпасть.")
+
+        with tab_errors:
+            if not xml_bytes:
+                st.info("Загрузите XML, чтобы проверить его по схеме")
+            elif not rows:
+                if check["stage"] == "ok":
+                    st.success("Ошибок нет")
+                else:
+                    st.info("Подробностей нет — см. сообщение выше")
+            else:
+                errors_df = pd.DataFrame(rows)
+                st.dataframe(errors_df, use_container_width=True, hide_index=True)
+
+                if check["stage"] in ("invalid", "xml_syntax"):
                     with st.expander("📍 Фрагменты XML с ошибками"):
                         show_error_context(xml_bytes, errors_df)
 
-                    st.download_button(
-                        label="📥 Скачать список ошибок (CSV)",
-                        data=errors_df.to_csv(index=False, sep=';').encode('utf-8-sig'),
-                        file_name="xml_validation_errors.csv",
-                        mime="text/csv",
-                        key="xml_errors_download",
-                    )
+                st.download_button(
+                    label="📥 Скачать список ошибок (CSV)",
+                    data=errors_df.to_csv(index=False, sep=';').encode('utf-8-sig'),
+                    file_name="xml_validation_errors.csv",
+                    mime="text/csv",
+                    key="xml_errors_download",
+                )
