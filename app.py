@@ -19,7 +19,8 @@ import zipfile
 import pandas as pd
 from lxml import etree  # Для валидации XML по XSD
 from xsd_tree import (XsdPackage, XsdTree, render_tree, xml_presence, collect_namespaces,
-                      error_element_path)
+                      error_element_path, element_docs, simple_type_bases)
+from xsd_explain import Explainer
 
 st.set_page_config(page_title="Утилиты для текста и данных", layout="wide")
 
@@ -273,10 +274,15 @@ def xsd_input_block():
         return {"schema.xsd": XML_DECLARATION_RE.sub('', text, count=1).strip().encode('utf-8')}
     return None
 
-def log_rows(error_log, xml_root=None, package=None):
+NS_RE = re.compile(r"\{[^}'\s]*\}")  # {http://...}имя → имя
+TYPE_ERR_RE = re.compile(r"is not a valid value of the (?:local )?(?:atomic|union|list) type")
+MAX_ERROR_CARDS = 50
+
+def log_rows(error_log, xml_root=None, package=None, explainer=None):
     """Превращает лог ошибок lxml в список словарей (для таблицы и кеша)"""
     ns = collect_namespaces(xml_root) if xml_root is not None else {}
     rows = []
+    prev_msg, prev_line = "", None
     for e in error_log:
         row = {}
         if package is not None:
@@ -285,7 +291,15 @@ def log_rows(error_log, xml_root=None, package=None):
         row.update({"Строка": e.line, "Колонка": e.column, "Уровень": e.level_name})
         if xml_root is not None:
             row["Элемент"] = error_element_path(e, xml_root, ns)
+        if explainer is not None:
+            row["Что не так"], row["Как исправить"] = explainer.explain(e.message)
         row["Сообщение"] = e.message
+        # libxml сообщает о нарушенном ограничении дважды: «[facet …]», затем «не тот тип» —
+        # второе помечаем как повтор, чтобы не дублировать карточки
+        row["Повтор"] = bool(TYPE_ERR_RE.search(e.message) and "[facet" in prev_msg
+                             and prev_line == e.line
+                             and prev_msg.split(":")[0] == e.message.split(":")[0])
+        prev_msg, prev_line = e.message, e.line
         rows.append(row)
     return rows
 
@@ -315,16 +329,33 @@ def build_xsd_tree(files, main, root_name):
     _, tree = _schema_tree(files, main)
     return tree.build(root_name), tree.truncated
 
+def _explainer_for(pkg, main, xml_doc):
+    """Объяснения учитывают префиксы из XML и описания элементов из схемы"""
+    nsmap = collect_namespaces(xml_doc)
+    if xml_doc.nsmap.get(None):
+        nsmap[None] = xml_doc.nsmap[None]
+    try:
+        schema_roots = [pkg.root(p) for p in pkg.reachable(main)]
+        main_root = pkg.root(main)
+        tns = main_root.get("targetNamespace", "")
+        roots = [f"<{g}>" + (f" в пространстве {tns}" if tns else "")
+                 for g in XsdTree(schema_roots, main_root).global_elements]
+        return Explainer(nsmap, element_docs(schema_roots), roots, simple_type_bases(schema_roots))
+    except ValueError:
+        return Explainer(nsmap)
+
 @st.cache_data(show_spinner=False, max_entries=10)
 def run_xml_check(files, main, xml_bytes):
     """Разбор XML, компиляция схемы и валидация. Результат — простые данные для кеша."""
     res = {"stage": "", "msg": "", "rows": [], "presence": None, "err_by_path": {}, "xml_root": None}
 
     # XML разбираем первым: присутствие элементов нужно дереву даже при ошибке в схеме
+    parser = safe_parser()
     try:
-        xml_doc = etree.fromstring(xml_bytes, safe_parser())
-    except etree.XMLSyntaxError as e:
-        res.update(stage="xml_syntax", rows=log_rows(e.error_log))
+        xml_doc = etree.fromstring(xml_bytes, parser)
+    except etree.XMLSyntaxError:
+        # Журнал именно этого парсера: в e.error_log бывают остатки прошлых проверок
+        res.update(stage="xml_syntax", rows=log_rows(parser.error_log, explainer=Explainer()))
         return res
     res["presence"] = xml_presence(xml_doc)
     res["xml_root"] = etree.QName(xml_doc).localname
@@ -342,34 +373,45 @@ def run_xml_check(files, main, xml_bytes):
     if schema.validate(xml_doc):
         res["stage"] = "ok"
     else:
-        rows = log_rows(schema.error_log, xml_doc)
+        rows = log_rows(schema.error_log, xml_doc, explainer=_explainer_for(pkg, main, xml_doc))
         err_by_path = {}
         for r in rows:
-            if r["Элемент"]:
-                err_by_path.setdefault(r["Элемент"], []).append(r["Сообщение"])
+            if r["Элемент"] and not r["Повтор"]:
+                err_by_path.setdefault(r["Элемент"], []).append(
+                    {"problem": r["Что не так"], "fix": r["Как исправить"], "raw": r["Сообщение"]})
         res.update(stage="invalid", rows=rows, err_by_path=err_by_path)
     return res
 
-def show_error_context(xml_bytes, errors_df, max_items=20):
-    """Показывает строки XML, в которых найдены ошибки"""
-    try:
-        lines = xml_bytes.decode('utf-8', errors='replace').splitlines()
-    except Exception:
-        return
-    shown = 0
-    for line_no in sorted(set(errors_df["Строка"].dropna().astype(int))):
-        if shown >= max_items:
-            st.caption(f"Показаны первые {max_items} строк с ошибками.")
-            break
-        if 1 <= line_no <= len(lines):
-            start = max(line_no - 2, 1)
-            end = min(line_no + 1, len(lines))
-            snippet = "\n".join(
-                f"{'>>' if i == line_no else '  '} {i:>5} | {lines[i - 1]}"
-                for i in range(start, end + 1)
-            )
-            st.code(snippet, language="")
-            shown += 1
+def xml_snippet(lines, line_no, around=1, width=300):
+    """Несколько строк XML вокруг строки с ошибкой"""
+    if not lines or not line_no or not (1 <= line_no <= len(lines)):
+        return ""
+    out = []
+    for i in range(max(1, line_no - around), min(len(lines), line_no + around) + 1):
+        text = lines[i - 1] if len(lines[i - 1]) <= width else lines[i - 1][:width] + " …"
+        out.append(f"{'▶' if i == line_no else '·'} {i:>5} │ {text}")
+    return "\n".join(out)
+
+def render_error_card(num, row, lines):
+    """Карточка ошибки: что не так, как исправить, фрагмент XML, исходное сообщение"""
+    e = html.escape
+    raw = NS_RE.sub("", row["Сообщение"]).strip()
+    problem = row.get("Что не так") or raw
+    where = " · ".join(x for x in (f"строка {row['Строка']}" if row.get("Строка") else "",
+                                   row.get("Элемент") or row.get("Файл") or "") if x)
+    with st.container(border=True):
+        st.markdown(f"<div style='font-weight:600'>{num}. {e(problem)}</div>"
+                    f"<div style='opacity:.65;font-size:.85em'>{e(where)}</div>",
+                    unsafe_allow_html=True)
+        if row.get("Как исправить"):
+            st.markdown(f"<div style='margin-top:4px'>✏️ {e(row['Как исправить'])}</div>",
+                        unsafe_allow_html=True)
+        snippet = xml_snippet(lines, row.get("Строка"))
+        if snippet:
+            st.code(snippet, language="xml")
+        if row.get("Что не так"):
+            st.markdown(f"<div style='opacity:.55;font-size:.8em'>Сообщение валидатора: {e(raw)}</div>",
+                        unsafe_allow_html=True)
 
 # --- Основной интерфейс ---
 
@@ -728,6 +770,7 @@ def xml_validation_tab():
 
     check = run_xml_check(xsd_files, main, xml_bytes) if xml_bytes else None
     rows = check["rows"] if check else []
+    main_rows = [r for r in rows if not r.get("Повтор")]
 
     # Итог проверки
     if check:
@@ -735,15 +778,17 @@ def xml_validation_tab():
         if stage == "ok":
             st.success("✅ XML соответствует XSD схеме")
         elif stage == "invalid":
-            st.error(f"❌ XML не прошёл валидацию. Найдено ошибок: {len(rows)}")
+            st.error(f"❌ XML не прошёл валидацию. Найдено ошибок: {len(main_rows)}. "
+                     "Что не так и как исправить — на вкладке «Ошибки».")
         elif stage == "xml_syntax":
-            st.error("❌ XML не является корректно сформированным (well-formed)")
+            st.error("❌ XML не является корректно сформированным (well-formed). "
+                     "Подробности — на вкладке «Ошибки».")
         elif stage == "xsd_syntax":
             st.error(f"❌ {check['msg']}")
         elif stage == "xsd_schema":
             st.error("❌ Ошибка в XSD схеме — проверить XML по ней нельзя. Подробности на вкладке «Ошибки».")
 
-    tab_tree, tab_errors = st.tabs(["🌳 Структура схемы", f"📋 Ошибки ({len(rows)})"])
+    tab_tree, tab_errors = st.tabs(["🌳 Структура схемы", f"📋 Ошибки ({len(main_rows)})"])
 
     with tab_tree:
         if tree_err:
@@ -781,12 +826,17 @@ def xml_validation_tab():
             else:
                 st.info("Подробностей нет — см. сообщение выше")
         else:
-            errors_df = pd.DataFrame(rows)
-            st.dataframe(errors_df, use_container_width=True, hide_index=True)
-
+            lines = []
             if check["stage"] in ("invalid", "xml_syntax"):
-                with st.expander("📍 Фрагменты XML с ошибками"):
-                    show_error_context(xml_bytes, errors_df)
+                lines = xml_bytes.decode("utf-8", errors="replace").splitlines()
+            for num, row in enumerate(main_rows[:MAX_ERROR_CARDS], 1):
+                render_error_card(num, row, lines)
+            if len(main_rows) > MAX_ERROR_CARDS:
+                st.caption(f"Показаны первые {MAX_ERROR_CARDS} ошибок — все есть в таблице и в CSV.")
+
+            errors_df = pd.DataFrame(rows).drop(columns=["Повтор"], errors="ignore")
+            with st.expander("📊 Таблица всех ошибок"):
+                st.dataframe(errors_df, use_container_width=True, hide_index=True)
 
             st.download_button(
                 label="📥 Скачать список ошибок (CSV)",
