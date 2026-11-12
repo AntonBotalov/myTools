@@ -11,9 +11,10 @@ import uuid
 import base64
 import io
 import re
+import zipfile
 import pandas as pd
 from lxml import etree  # Для валидации XML по XSD
-from xsd_tree import (XsdTree, render_tree, xml_presence, collect_namespaces,
+from xsd_tree import (XsdPackage, XsdTree, render_tree, xml_presence, collect_namespaces,
                       error_element_path)
 
 st.set_page_config(page_title="Утилиты для текста и данных", layout="wide")
@@ -112,12 +113,74 @@ def safe_parser():
     """Парсер без загрузки внешних сущностей и сети (защита от XXE)"""
     return etree.XMLParser(resolve_entities=False, no_network=True, huge_tree=False)
 
-def log_rows(error_log, xml_root=None):
+MAX_ARCHIVE_BYTES = 50 * 1024 * 1024
+
+def read_xsd_uploads(uploads):
+    """Загруженные XSD и ZIP-архивы → ({путь: байты}, предупреждения). Из архива берутся только .xsd"""
+    files, warnings = {}, []
+    for up in uploads:
+        low = up.name.lower()
+        if low.endswith(".zip"):
+            try:
+                with zipfile.ZipFile(io.BytesIO(up.getvalue())) as z:
+                    total = 0
+                    for info in z.infolist():
+                        name = info.filename
+                        if not info.flag_bits & 0x800:
+                            # Имя не в UTF-8 — архивы из Windows обычно хранят его в cp866
+                            try:
+                                name = name.encode("cp437").decode("cp866")
+                            except UnicodeError:
+                                pass
+                        if info.is_dir() or not name.lower().endswith(".xsd"):
+                            continue
+                        total += info.file_size
+                        if total > MAX_ARCHIVE_BYTES:
+                            warnings.append(f"{up.name}: больше 50 МБ схем, остальные файлы пропущены")
+                            break
+                        files[name] = z.read(info)
+            except zipfile.BadZipFile:
+                warnings.append(f"{up.name}: не удалось открыть ZIP-архив")
+        elif low.endswith((".rar", ".7z")):
+            fmt = low.rsplit(".", 1)[1].upper()
+            warnings.append(f"{up.name}: формат {fmt} не поддерживается. Перепакуйте схему в ZIP "
+                            "или выберите сразу все .xsd файлы из распакованной папки.")
+        else:
+            files[up.name] = up.getvalue()
+    return files, warnings
+
+def xsd_input_block():
+    """Ввод XSD: файлы / ZIP или текст. Возвращает {путь: байты} или None."""
+    st.subheader("📐 XSD схема")
+    mode = st.radio("Способ загрузки:", ["📁 Файлы или ZIP", "📝 Текст"],
+                    key="xsd_mode", horizontal=True)
+    if mode == "📁 Файлы или ZIP":
+        uploads = st.file_uploader(
+            "Один XSD, все XSD схемы сразу или ZIP-архив",
+            type=["xsd", "xml", "zip", "rar", "7z"], accept_multiple_files=True, key="xsd_files",
+            help="Если схема подключает другие файлы через xs:import / xs:include, "
+                 "загрузите их все вместе или одним ZIP-архивом.")
+        if not uploads:
+            return None
+        files, warnings = read_xsd_uploads(uploads)
+        for w in warnings:
+            st.warning(w)
+        return files or None
+    text = st.text_area("Вставьте содержимое", height=350, key="xsd_text")
+    if text.strip():
+        return {"schema.xsd": XML_DECLARATION_RE.sub('', text, count=1).strip().encode('utf-8')}
+    return None
+
+def log_rows(error_log, xml_root=None, package=None):
     """Превращает лог ошибок lxml в список словарей (для таблицы и кеша)"""
     ns = collect_namespaces(xml_root) if xml_root is not None else {}
     rows = []
     for e in error_log:
-        row = {"Строка": e.line, "Колонка": e.column, "Уровень": e.level_name}
+        row = {}
+        if package is not None:
+            fname = package.short_name(e.filename)
+            row["Файл"] = "(файл не найден в пакете)" if fname == "<string>" else fname
+        row.update({"Строка": e.line, "Колонка": e.column, "Уровень": e.level_name})
         if xml_root is not None:
             row["Элемент"] = error_element_path(e, xml_root, ns)
         row["Сообщение"] = e.message
@@ -125,7 +188,33 @@ def log_rows(error_log, xml_root=None):
     return rows
 
 @st.cache_data(show_spinner=False, max_entries=10)
-def run_xml_check(xsd_bytes, xml_bytes):
+def xsd_package_info(files):
+    """Кандидаты в главную схему (на которые никто не ссылается). Возвращает (список, ошибка)."""
+    try:
+        return XsdPackage(files).main_candidates(), ""
+    except ValueError as e:
+        return [], str(e)
+
+def _schema_tree(files, main):
+    pkg = XsdPackage(files)
+    return pkg, XsdTree([pkg.root(p) for p in pkg.reachable(main)], pkg.root(main))
+
+@st.cache_data(show_spinner=False, max_entries=10)
+def xsd_global_elements(files, main):
+    """Глобальные элементы главной схемы и недостающие файлы. Возвращает (корни, недостающие, ошибка)."""
+    try:
+        pkg, tree = _schema_tree(files, main)
+        return tree.global_elements, pkg.missing_references(main), ""
+    except ValueError as e:
+        return [], [], str(e)
+
+@st.cache_data(show_spinner=False, max_entries=10)
+def build_xsd_tree(files, main, root_name):
+    _, tree = _schema_tree(files, main)
+    return tree.build(root_name), tree.truncated
+
+@st.cache_data(show_spinner=False, max_entries=10)
+def run_xml_check(files, main, xml_bytes):
     """Разбор XML, компиляция схемы и валидация. Результат — простые данные для кеша."""
     res = {"stage": "", "msg": "", "rows": [], "presence": None, "err_by_path": {}, "xml_root": None}
 
@@ -138,13 +227,14 @@ def run_xml_check(xsd_bytes, xml_bytes):
     res["presence"] = xml_presence(xml_doc)
     res["xml_root"] = etree.QName(xml_doc).localname
 
+    pkg = XsdPackage(files)
     try:
-        schema = etree.XMLSchema(etree.fromstring(xsd_bytes, safe_parser()))
-    except etree.XMLSyntaxError as e:
+        schema = pkg.schema(main)
+    except (etree.XMLSyntaxError, ValueError) as e:
         res.update(stage="xsd_syntax", msg=str(e))
         return res
     except etree.XMLSchemaParseError as e:
-        res.update(stage="xsd_schema", rows=log_rows(e.error_log))
+        res.update(stage="xsd_schema", rows=log_rows(e.error_log, package=pkg))
         return res
 
     if schema.validate(xml_doc):
@@ -157,19 +247,6 @@ def run_xml_check(xsd_bytes, xml_bytes):
                 err_by_path.setdefault(r["Элемент"], []).append(r["Сообщение"])
         res.update(stage="invalid", rows=rows, err_by_path=err_by_path)
     return res
-
-@st.cache_data(show_spinner=False, max_entries=10)
-def xsd_global_elements(xsd_bytes):
-    """Глобальные элементы схемы — кандидаты в корень. Возвращает (список, ошибка)."""
-    try:
-        return XsdTree(etree.fromstring(xsd_bytes, safe_parser())).global_elements, ""
-    except etree.XMLSyntaxError as e:
-        return [], f"XSD не является корректным XML: {e}"
-
-@st.cache_data(show_spinner=False, max_entries=10)
-def build_xsd_tree(xsd_bytes, root_name):
-    tree = XsdTree(etree.fromstring(xsd_bytes, safe_parser()))
-    return tree.build(root_name), tree.truncated
 
 def show_error_context(xml_bytes, errors_df, max_items=20):
     """Показывает строки XML, в которых найдены ошибки"""
@@ -511,89 +588,111 @@ with tabs[6]:
             st.error(f"Ошибка при обработке файлов: {e}")
 
 # 8. Валидация XML по XSD
-with tabs[7]:
+def xml_validation_tab():
     st.header("✅ Валидация XML по XSD схеме")
     st.markdown("Загрузите XSD схему — появится её структура. Добавьте XML, чтобы проверить его по схеме "
                 "и увидеть в дереве, каких элементов не хватает и где ошибки.")
 
     col_xsd, col_xml = st.columns(2)
     with col_xsd:
-        xsd_bytes = xml_input_block("📐 XSD схема", "xsd", ["xsd", "xml"])
+        xsd_files = xsd_input_block()
     with col_xml:
         xml_bytes = xml_input_block("📄 XML документ", "xml", ["xml"])
 
-    if not xsd_bytes:
+    if not xsd_files:
         st.info("Загрузите или вставьте XSD схему")
+        return
+
+    candidates, pkg_err = xsd_package_info(xsd_files)
+    if pkg_err:
+        st.error(f"❌ {pkg_err}")
+        return
+
+    if len(candidates) > 1:
+        main = st.selectbox("Главная схема", candidates, key="xsd_main",
+                            help="Файл, с которого начинается схема. Остальные подключаются "
+                                 "из него через xs:import / xs:include.")
     else:
-        check = run_xml_check(xsd_bytes, xml_bytes) if xml_bytes else None
-        rows = check["rows"] if check else []
+        main = candidates[0]
+    if len(xsd_files) > 1:
+        st.caption(f"Файлов схемы в пакете: {len(xsd_files)}")
 
-        # Итог проверки
-        if check:
-            stage = check["stage"]
-            if stage == "ok":
-                st.success("✅ XML соответствует XSD схеме")
-            elif stage == "invalid":
-                st.error(f"❌ XML не прошёл валидацию. Найдено ошибок: {len(rows)}")
-            elif stage == "xml_syntax":
-                st.error("❌ XML не является корректно сформированным (well-formed)")
-            elif stage == "xsd_syntax":
-                st.error(f"❌ XSD не является корректным XML: {check['msg']}")
-            elif stage == "xsd_schema":
-                st.error("❌ Ошибка в XSD схеме — проверить XML по ней нельзя")
-                st.info("Если схема использует xs:include / xs:import с внешними файлами, "
-                        "их нужно встроить в одну схему — внешние ссылки здесь не загружаются.")
+    roots, missing, tree_err = xsd_global_elements(xsd_files, main)
+    if missing:
+        shown = "\n".join(f"- `{m}`" for m in missing[:8])
+        more = f"\n- … и ещё {len(missing) - 8}" if len(missing) > 8 else ""
+        st.warning("Схема ссылается на файлы, которых нет среди загруженных — "
+                   "добавьте их или загрузите всю папку ZIP-архивом:\n" + shown + more)
 
-        tab_tree, tab_errors = st.tabs(["🌳 Структура схемы", f"📋 Ошибки ({len(rows)})"])
+    check = run_xml_check(xsd_files, main, xml_bytes) if xml_bytes else None
+    rows = check["rows"] if check else []
 
-        with tab_tree:
-            roots, xsd_err = xsd_global_elements(xsd_bytes)
-            if xsd_err:
-                st.error(xsd_err)
-            elif not roots:
-                st.warning("В схеме нет глобальных элементов (xs:element верхнего уровня) — "
-                           "нечего показать в качестве корня.")
+    # Итог проверки
+    if check:
+        stage = check["stage"]
+        if stage == "ok":
+            st.success("✅ XML соответствует XSD схеме")
+        elif stage == "invalid":
+            st.error(f"❌ XML не прошёл валидацию. Найдено ошибок: {len(rows)}")
+        elif stage == "xml_syntax":
+            st.error("❌ XML не является корректно сформированным (well-formed)")
+        elif stage == "xsd_syntax":
+            st.error(f"❌ {check['msg']}")
+        elif stage == "xsd_schema":
+            st.error("❌ Ошибка в XSD схеме — проверить XML по ней нельзя. Подробности на вкладке «Ошибки».")
+
+    tab_tree, tab_errors = st.tabs(["🌳 Структура схемы", f"📋 Ошибки ({len(rows)})"])
+
+    with tab_tree:
+        if tree_err:
+            st.error(f"❌ {tree_err}")
+        elif not roots:
+            st.warning("В главной схеме нет глобальных элементов (xs:element верхнего уровня) — "
+                       "нечего показать в качестве корня. Возможно, выбрана не та главная схема.")
+        else:
+            xml_root = check["xml_root"] if check else None
+            default_idx = roots.index(xml_root) if xml_root in roots else 0
+            if len(roots) > 1:
+                root_name = st.selectbox("Корневой элемент", roots, index=default_idx,
+                                         key="xsd_tree_root")
             else:
-                xml_root = check["xml_root"] if check else None
-                default_idx = roots.index(xml_root) if xml_root in roots else 0
-                if len(roots) > 1:
-                    root_name = st.selectbox("Корневой элемент", roots, index=default_idx,
-                                             key="xsd_tree_root")
-                else:
-                    root_name = roots[0]
+                root_name = roots[0]
 
-                tree_node, truncated = build_xsd_tree(xsd_bytes, root_name)
-                presence = check["presence"] if check else None
-                err_by_path = check["err_by_path"] if check else {}
-                components.html(render_tree(tree_node, presence, err_by_path),
-                                height=720, scrolling=True)
+            tree_node, truncated = build_xsd_tree(xsd_files, main, root_name)
+            presence = check["presence"] if check else None
+            err_by_path = check["err_by_path"] if check else {}
+            components.html(render_tree(tree_node, presence, err_by_path),
+                            height=720, scrolling=True)
 
-                if truncated:
-                    st.caption("Схема очень большая — дерево показано не полностью.")
-                if xml_root and xml_root != root_name:
-                    st.caption(f"Корень XML — «{xml_root}», а в дереве выбран «{root_name}»: "
-                               "отметки присутствия могут не совпасть.")
+            if truncated:
+                st.caption("Схема очень большая — дерево показано не полностью.")
+            if xml_root and xml_root != root_name:
+                st.caption(f"Корень XML — «{xml_root}», а в дереве выбран «{root_name}»: "
+                           "отметки присутствия могут не совпасть.")
 
-        with tab_errors:
-            if not xml_bytes:
-                st.info("Загрузите XML, чтобы проверить его по схеме")
-            elif not rows:
-                if check["stage"] == "ok":
-                    st.success("Ошибок нет")
-                else:
-                    st.info("Подробностей нет — см. сообщение выше")
+    with tab_errors:
+        if not xml_bytes:
+            st.info("Загрузите XML, чтобы проверить его по схеме")
+        elif not rows:
+            if check["stage"] == "ok":
+                st.success("Ошибок нет")
             else:
-                errors_df = pd.DataFrame(rows)
-                st.dataframe(errors_df, use_container_width=True, hide_index=True)
+                st.info("Подробностей нет — см. сообщение выше")
+        else:
+            errors_df = pd.DataFrame(rows)
+            st.dataframe(errors_df, use_container_width=True, hide_index=True)
 
-                if check["stage"] in ("invalid", "xml_syntax"):
-                    with st.expander("📍 Фрагменты XML с ошибками"):
-                        show_error_context(xml_bytes, errors_df)
+            if check["stage"] in ("invalid", "xml_syntax"):
+                with st.expander("📍 Фрагменты XML с ошибками"):
+                    show_error_context(xml_bytes, errors_df)
 
-                st.download_button(
-                    label="📥 Скачать список ошибок (CSV)",
-                    data=errors_df.to_csv(index=False, sep=';').encode('utf-8-sig'),
-                    file_name="xml_validation_errors.csv",
-                    mime="text/csv",
-                    key="xml_errors_download",
-                )
+            st.download_button(
+                label="📥 Скачать список ошибок (CSV)",
+                data=errors_df.to_csv(index=False, sep=';').encode('utf-8-sig'),
+                file_name="xml_validation_errors.csv",
+                mime="text/csv",
+                key="xml_errors_download",
+            )
+
+with tabs[7]:
+    xml_validation_tab()
